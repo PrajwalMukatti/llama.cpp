@@ -4,8 +4,9 @@ $file = "$SourceDir\ggml\src\ggml-vulkan\ggml-vulkan.cpp"
 Write-Host "Patching: $file"
 $c = Get-Content $file -Raw
 
-# 1 - Add vk_gdn_fused_cache struct after push_constants
-$structTarget = "static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);"
+# 1 - Add vk_gdn_fused_cache struct after the push_constants closing brace
+# The struct ends with "};" followed by blank line + "struct vk_op_ssm_scan_push_constants"
+# Try multiple targets for compatibility across builds
 $structAdd = @"
 
 struct vk_gdn_fused_cache {
@@ -13,11 +14,23 @@ struct vk_gdn_fused_cache {
     int64_t  slot_stride;
     uint32_t s_off_cache;
 };
+
 "@
-if ($c.Contains($structTarget)) {
-    $c = $c.Replace($structTarget, $structTarget + $structAdd)
-    Write-Host "Step 1 OK: added vk_gdn_fused_cache"
-} else { Write-Error "Step 1 FAILED: target not found"; exit 1 }
+$targets = @(
+    "static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);",
+    "};`r`n`r`nstruct vk_op_ssm_scan_push_constants {",
+    "};`n`nstruct vk_op_ssm_scan_push_constants {"
+)
+$step1done = $false
+foreach ($t in $targets) {
+    if ($c.Contains($t)) {
+        $c = $c.Replace($t, $t + $structAdd)
+        Write-Host "Step 1 OK: added vk_gdn_fused_cache (target: $($t.Substring(0,[Math]::Min(40,$t.Length))))"
+        $step1done = $true
+        break
+    }
+}
+if (-not $step1done) { Write-Error "Step 1 FAILED: no target found"; exit 1 }
 
 # 2 - Add fusion function before ggml_vk_gated_delta_net
 $fusionFn = @"
@@ -51,41 +64,60 @@ static int ggml_vk_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx
 }
 
 "@
-$funcTarget = "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {"
-if ($c.Contains($funcTarget)) {
-    $c = $c.Replace($funcTarget, $fusionFn + $funcTarget)
-    Write-Host "Step 2 OK: added ggml_vk_try_gdn_cache_fusion"
-} else { Write-Error "Step 2 FAILED: gated_delta_net function not found"; exit 1 }
-
-# 3 - Update signature to accept optional cache
-$oldSig = "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {"
-$newSig = "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_gdn_fused_cache * fused_cache = nullptr) {"
-$c = $c.Replace($oldSig, $newSig)
-Write-Host "Step 3 OK: updated signature"
-
-# 4 - Add fusion check in dispatch case
-$oldDispatch = "    case GGML_OP_GATED_DELTA_NET:`n        ggml_vk_gated_delta_net(ctx, compute_ctx, node);"
-$newDispatch = @"
-    case GGML_OP_GATED_DELTA_NET:
-        {
-            vk_gdn_fused_cache fc;
-            const int skip = ggml_vk_try_gdn_cache_fusion(cgraph, node_idx, fc);
-            if (skip > 0) ctx->num_additional_fused_ops = skip;
-            ggml_vk_gated_delta_net(ctx, compute_ctx, node, skip > 0 ? &fc : nullptr);
-        }
-"@
-# Try both LF and CRLF versions
-if ($c.Contains("    case GGML_OP_GATED_DELTA_NET:`r`n        ggml_vk_gated_delta_net(ctx, compute_ctx, node);")) {
-    $c = $c.Replace("    case GGML_OP_GATED_DELTA_NET:`r`n        ggml_vk_gated_delta_net(ctx, compute_ctx, node);", $newDispatch)
-    Write-Host "Step 4 OK: added fusion dispatch (CRLF)"
-} elseif ($c.Contains("    case GGML_OP_GATED_DELTA_NET:`n        ggml_vk_gated_delta_net(ctx, compute_ctx, node);")) {
-    $c = $c.Replace("    case GGML_OP_GATED_DELTA_NET:`n        ggml_vk_gated_delta_net(ctx, compute_ctx, node);", $newDispatch)
-    Write-Host "Step 4 OK: added fusion dispatch (LF)"
-} else {
-    Write-Host "Step 4 WARNING: dispatch pattern not found - checking context..."
-    $idx = $c.IndexOf("GGML_OP_GATED_DELTA_NET")
-    if ($idx -ge 0) { Write-Host "Found at index $idx :" $c.Substring($idx, [Math]::Min(200, $c.Length - $idx)) }
+$funcTargets = @(
+    "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {",
+    "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor *`r`n"
+)
+$step2done = $false
+foreach ($ft in $funcTargets) {
+    if ($c.Contains($ft)) {
+        $c = $c.Replace($ft, $fusionFn + $ft)
+        Write-Host "Step 2 OK: added ggml_vk_try_gdn_cache_fusion"
+        $step2done = $true; break
+    }
 }
+# Try prefix match
+if (-not $step2done) {
+    $idx = $c.IndexOf("static void ggml_vk_gated_delta_net(")
+    if ($idx -ge 0) {
+        $end = $c.IndexOf("{", $idx) + 1
+        $orig = $c.Substring($idx, $end - $idx)
+        $c = $c.Remove($idx, $end - $idx).Insert($idx, $fusionFn + $orig)
+        Write-Host "Step 2 OK: added via prefix match"
+        $step2done = $true
+    }
+}
+if (-not $step2done) { Write-Error "Step 2 FAILED: function not found"; exit 1 }
+
+# 3 - Update signature to accept optional cache (use prefix match)
+$sigIdx = $c.IndexOf("static void ggml_vk_gated_delta_net(")
+if ($sigIdx -ge 0) {
+    $sigEnd = $c.IndexOf("{", $sigIdx) + 1
+    $oldSig = $c.Substring($sigIdx, $sigEnd - $sigIdx)
+    # Find the closing paren of the params and insert before the {
+    $parenClose = $c.LastIndexOf(")", $sigEnd)
+    $newSig = $oldSig.Substring(0, $parenClose - $sigIdx) + ", const vk_gdn_fused_cache * fused_cache = nullptr" + $oldSig.Substring($parenClose - $sigIdx)
+    $c = $c.Remove($sigIdx, $sigEnd - $sigIdx).Insert($sigIdx, $newSig)
+    Write-Host "Step 3 OK: updated signature"
+} else { Write-Error "Step 3 FAILED"; exit 1 }
+
+# 4 - Add fusion check in dispatch case (find by searching for the call site)
+$callIdx = $c.IndexOf("ggml_vk_gated_delta_net(ctx, compute_ctx, node);")
+if ($callIdx -ge 0) {
+    # Find the "case GGML_OP_GATED_DELTA_NET:" line before this call
+    $caseIdx = $c.LastIndexOf("case GGML_OP_GATED_DELTA_NET:", $callIdx)
+    $callEnd = $callIdx + "ggml_vk_gated_delta_net(ctx, compute_ctx, node);".Length
+    $origBlock = $c.Substring($caseIdx, $callEnd - $caseIdx)
+    $newBlock = "case GGML_OP_GATED_DELTA_NET:" + [System.Environment]::NewLine +
+                "        {" + [System.Environment]::NewLine +
+                "            vk_gdn_fused_cache fc;" + [System.Environment]::NewLine +
+                "            const int skip = ggml_vk_try_gdn_cache_fusion(cgraph, node_idx, fc);" + [System.Environment]::NewLine +
+                "            if (skip > 0) ctx->num_additional_fused_ops = skip;" + [System.Environment]::NewLine +
+                "            ggml_vk_gated_delta_net(ctx, compute_ctx, node, skip > 0 ? &fc : nullptr);" + [System.Environment]::NewLine +
+                "        }"
+    $c = $c.Remove($caseIdx, $callEnd - $caseIdx).Insert($caseIdx, $newBlock)
+    Write-Host "Step 4 OK: added fusion dispatch"
+} else { Write-Host "Step 4 WARNING: call site not found (may already be patched)" }
 
 Set-Content $file $c -NoNewline
 Write-Host ""

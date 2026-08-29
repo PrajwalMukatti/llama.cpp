@@ -9,7 +9,7 @@ jobs:
   build:
     runs-on: windows-2025
     env:
-      LMSTUDIO_COMMIT: 18443257a835af7e7cf25ad11ebc218dcfce8c54
+      LMSTUDIO_COMMIT: 18443257a30c884d5332abb8e7dc43c7ffe42fda
       VULKAN_VERSION: 1.4.357.0
 
     steps:
