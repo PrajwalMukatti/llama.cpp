@@ -30,8 +30,8 @@ if ($c.Contains($insertAfter)) {
 } else { Write-Error "Step 1a FAILED"; exit 1 }
 
 # 1b. Add state_out_off + state_slot_stride to push_constants struct
-$pcTarget = "    uint32_t K;`r`n};"
-$pcReplace = "    uint32_t K;`r`n    uint32_t state_out_off;   // sentinel: 0=non-fused, N+1=fused with cache element-offset N
+$pcTarget  = "    uint32_t K;`r`n};"
+$pcReplace = "    uint32_t K;`r`n    uint32_t state_out_off;   // sentinel: 0=non-fused, N+1=fused with cache offset N`r`n};"
 # Only replace the FIRST occurrence (the gdn push_constants, not any other struct)
 $pcIdx = $c.IndexOf($pcTarget)
 if ($pcIdx -ge 0) {
