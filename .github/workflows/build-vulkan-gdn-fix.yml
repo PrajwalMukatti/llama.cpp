@@ -24,18 +24,6 @@ jobs:
           Write-Host "Checked out:" (git log -1 --oneline)
         shell: pwsh
 
-      - name: Apply GDN cache fusion patch
-        run: |
-          cd source
-          # Apply our fix to ggml-vulkan.cpp at this exact commit
-          $patchContent = @'
---- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-+++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
-'@
-          # We'll apply the changes directly via PowerShell since patch format may differ
-          Write-Host "Patch will be applied in build step"
-        shell: pwsh
-
       - name: Apply fix directly to source
         run: |
           $file = "source\ggml\src\ggml-vulkan\ggml-vulkan.cpp"
