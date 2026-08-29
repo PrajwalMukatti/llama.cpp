@@ -51,6 +51,11 @@ if ($c.Contains($old7)) {
 # 1d. Add ggml_vk_try_gdn_cache_fusion function before ggml_vk_gated_delta_net
 $fusionFn = @"
 static int ggml_vk_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx, vk_gdn_fused_cache & fc) {
+    // A/B + kill-switch, mirroring CUDA's GGML_CUDA_DISABLE_FUSION. Set GGML_VK_DISABLE_FUSION=1
+    // to force the non-fused path (state -> dst -> CPY), for correctness verification or if a
+    // driver misbehaves. Cached once: getenv is not free and this runs per GDN node per token.
+    static const bool disable_fusion = getenv("GGML_VK_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_VK_DISABLE_FUSION")) != 0;
+    if (disable_fusion) return 0;
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
     if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 || (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) return 0;
     const ggml_tensor * src_v = gdn->src[2];
