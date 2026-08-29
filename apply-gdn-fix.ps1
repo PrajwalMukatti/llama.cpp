@@ -31,7 +31,7 @@ if ($c.Contains($insertAfter)) {
 
 # 1b. Add state_out_off + state_slot_stride to push_constants struct
 $pcTarget = "    uint32_t K;`r`n};"
-$pcReplace = "    uint32_t K;`r`n    uint32_t state_out_off;     // 0 = non-fused; >0 = write state to cache binding 7`r`n    uint32_t state_slot_stride; // stride between rollback slots in float elements`r`n};"
+$pcReplace = "    uint32_t K;`r`n    uint32_t state_out_off;   // sentinel: 0=non-fused, N+1=fused with cache element-offset N
 # Only replace the FIRST occurrence (the gdn push_constants, not any other struct)
 $pcIdx = $c.IndexOf($pcTarget)
 if ($pcIdx -ge 0) {
@@ -71,11 +71,19 @@ static int ggml_vk_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx
     const std::array<int64_t, GGML_MAX_DIMS> ne = { D, n_seqs, n_written, 1 };
     if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || !dst->data || !dst->buffer ||
         !std::equal(ne.begin(), ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
-        dst->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, D)) return 0;
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32)) return 0;
+    // NOTE: dst->nb[1] is the KV cache row stride (mem_size * row_size), NOT D*sizeof(float).
+    // We check src->nb[1] instead — src is a contiguous view of gdn_out with stride D.
+    if (src->nb[1] != (size_t)ggml_row_size(GGML_TYPE_F32, D)) return 0;
     fc.data = (float *)dst->data;
+    // slot_stride: stride between rollback slots in the KV cache (in float elements)
+    // dst->nb[2] = mem_size * row_size = stride between snapshot slots
     fc.slot_stride = K > 1 ? (int64_t)(dst->nb[2] / sizeof(float)) : 0;
-    fc.s_off_cache = (uint32_t)((char *)dst->data - (char *)ggml_backend_buffer_get_base(dst->buffer));
+    // s_off_cache: byte offset of dst->data from the buffer base, in float elements.
+    // Sentinel: pass (offset + 1) so the shader can use > 0 as the "fused" test
+    // even when the real offset is 0 (which is valid for slot 0 at buffer start).
+    const uint32_t byte_off = (uint32_t)((char *)dst->data - (char *)ggml_backend_buffer_get_base(dst->buffer));
+    fc.s_off_cache = byte_off / sizeof(float) + 1u; // +1 sentinel
     return skip;
 }
 
