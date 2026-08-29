@@ -12984,7 +12984,7 @@ static int ggml_vk_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx
     fused_cache.data        = (float *) dst->data;
     fused_cache.slot_stride = K > 1 ? (int64_t)(dst->nb[2] / sizeof(float)) : 0;
     // byte offset of dst->data from start of its Vulkan buffer
-    fused_cache.s_off_cache = (uint32_t)((char *)dst->data - (char *)dst->buffer->data);
+    fused_cache.s_off_cache = (uint32_t)((char *)dst->data - (char *)ggml_backend_buffer_get_base(dst->buffer));
     return skip;
 }
 
