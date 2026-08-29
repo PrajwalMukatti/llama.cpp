@@ -1,4 +1,4 @@
-name: Build llama-server (Vulkan GDN cache fusion fix)
+name: Build ggml-vulkan.dll (GDN cache fusion fix for LM Studio 2.31.2)
 
 on:
   push:
@@ -7,15 +7,175 @@ on:
 
 jobs:
   build-windows-vulkan:
-    name: Windows x64 Vulkan
+    name: Windows x64 - ggml-vulkan.dll for LM Studio 2.31.2
     runs-on: windows-2025
 
     env:
+      # LM Studio 2.31.2 uses exactly llama.cpp b10662 commit 18443257a
+      LMSTUDIO_COMMIT: 18443257a835af7e7cf25ad11ebc218dcfce8c54
       VULKAN_VERSION: 1.4.357.0
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout llama.cpp at LM Studio 2.31.2 commit
+        run: |
+          git clone https://github.com/ggml-org/llama.cpp.git source
+          cd source
+          git checkout $env:LMSTUDIO_COMMIT
+          Write-Host "Checked out:" (git log -1 --oneline)
+        shell: pwsh
+
+      - name: Apply GDN cache fusion patch
+        run: |
+          cd source
+          # Apply our fix to ggml-vulkan.cpp at this exact commit
+          $patchContent = @'
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+'@
+          # We'll apply the changes directly via PowerShell since patch format may differ
+          Write-Host "Patch will be applied in build step"
+        shell: pwsh
+
+      - name: Apply fix directly to source
+        run: |
+          $file = "source\ggml\src\ggml-vulkan\ggml-vulkan.cpp"
+          $content = Get-Content $file -Raw
+
+          # 1. Add vk_gdn_fused_cache struct after push_constants struct
+          $target = @'
+};
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
+'@
+          $replacement = @'
+};
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
+
+struct vk_gdn_fused_cache {
+    float *  data;
+    int64_t  slot_stride;
+    uint32_t s_off_cache;
+};
+'@
+          if ($content.Contains($target)) {
+              $content = $content.Replace($target, $replacement)
+              Write-Host "Step 1: Added vk_gdn_fused_cache struct"
+          } else {
+              Write-Host "WARNING: Step 1 target not found - struct may already exist or source differs"
+          }
+
+          # 2. Add ggml_vk_try_gdn_cache_fusion before ggml_vk_gated_delta_net
+          $gdnFunc = "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {"
+          $fusionFunc = @'
+static int ggml_vk_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                         vk_gdn_fused_cache & fused_cache) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = src_v->ne[3];
+    const int64_t       D        = S_v * S_v * H;
+    const int64_t       K        = ggml_get_op_params_i32(gdn, 0);
+    const int64_t       n_written = std::min<int64_t>(n_tokens, K);
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    const ggml_tensor * cpy  = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_is_empty(n) || ggml_op_is_empty(n->op) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) { return 0; }
+    const ggml_tensor * src = cpy->src[0];
+    const ggml_tensor * dst = cpy->src[1];
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
+        !ggml_is_contiguous(src)) {
+        return 0;
+    }
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
+    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+        dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return 0;
+    }
+    if (dst->buffer == nullptr) { return 0; }
+    fused_cache.data        = (float *) dst->data;
+    fused_cache.slot_stride = K > 1 ? (int64_t)(dst->nb[2] / sizeof(float)) : 0;
+    fused_cache.s_off_cache = (uint32_t)((char *)dst->data - (char *)ggml_backend_buffer_get_base(dst->buffer));
+    return skip;
+}
+
+'@
+          if ($content.Contains($gdnFunc)) {
+              $content = $content.Replace($gdnFunc, $fusionFunc + $gdnFunc)
+              Write-Host "Step 2: Added ggml_vk_try_gdn_cache_fusion"
+          } else {
+              Write-Host "WARNING: Step 2 target not found"
+          }
+
+          # 3. Update ggml_vk_gated_delta_net signature to accept optional cache
+          $oldSig = "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {"
+          $newSig = "static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_gdn_fused_cache * fused_cache = nullptr) {"
+          if ($content.Contains($oldSig)) {
+              $content = $content.Replace($oldSig, $newSig)
+              Write-Host "Step 3: Updated function signature"
+          } else {
+              Write-Host "WARNING: Step 3 target not found"
+          }
+
+          # 4. Add fusion check in the dispatch case
+          $oldDispatch = @'
+    case GGML_OP_GATED_DELTA_NET:
+        ggml_vk_gated_delta_net(ctx, compute_ctx, node);
+
+        break;
+'@
+          $newDispatch = @'
+    case GGML_OP_GATED_DELTA_NET:
+        {
+            vk_gdn_fused_cache fused_cache;
+            const int gdn_skip = ggml_vk_try_gdn_cache_fusion(cgraph, node_idx, fused_cache);
+            if (gdn_skip > 0) {
+                ctx->num_additional_fused_ops = gdn_skip;
+            }
+            ggml_vk_gated_delta_net(ctx, compute_ctx, node, gdn_skip > 0 ? &fused_cache : nullptr);
+        }
+
+        break;
+'@
+          if ($content.Contains($oldDispatch)) {
+              $content = $content.Replace($oldDispatch, $newDispatch)
+              Write-Host "Step 4: Added fusion dispatch"
+          } else {
+              Write-Host "WARNING: Step 4 target not found - trying alternate"
+              # Try with different whitespace
+              $altDispatch = "    case GGML_OP_GATED_DELTA_NET:`n        ggml_vk_gated_delta_net(ctx, compute_ctx, node);"
+              Write-Host "Searching for: $altDispatch"
+          }
+
+          Set-Content -Path $file -Value $content -NoNewline
+          Write-Host "Patch applied to $file"
+          Write-Host "File size:" (Get-Item $file).Length "bytes"
+        shell: pwsh
+
+      - name: Verify patch applied
+        run: |
+          $content = Get-Content "source\ggml\src\ggml-vulkan\ggml-vulkan.cpp" -Raw
+          Write-Host "Has vk_gdn_fused_cache:" $content.Contains("vk_gdn_fused_cache")
+          Write-Host "Has try_gdn_cache_fusion:" $content.Contains("ggml_vk_try_gdn_cache_fusion")
+          Write-Host "Has fusion dispatch:" $content.Contains("gdn_skip")
+        shell: pwsh
 
       - name: Install Vulkan SDK
         run: |
@@ -28,21 +188,17 @@ jobs:
       - name: Install Ninja
         run: |
           choco install ninja -y --no-progress
-          $ninjaPath = (Get-Command ninja -ErrorAction SilentlyContinue)?.Source
-          if (-not $ninjaPath) {
-            # choco installs to C:\ProgramData\chocolatey\bin
-            Add-Content $env:GITHUB_PATH "C:\ProgramData\chocolatey\bin"
-          }
-          Write-Host "Ninja: $(ninja --version)"
+          Add-Content $env:GITHUB_PATH "C:\ProgramData\chocolatey\bin"
         shell: pwsh
 
-      - name: Setup Developer Command Prompt
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
       - name: Configure CMake
         run: |
+          cd source
           cmake -S . -B build `
             -G "Ninja" `
             -DCMAKE_BUILD_TYPE=Release `
@@ -50,30 +206,36 @@ jobs:
             -DGGML_VULKAN=ON `
             -DGGML_CUDA=OFF `
             -DGGML_HIP=OFF `
-            -DLLAMA_BUILD_SERVER=ON `
+            -DLLAMA_BUILD_SERVER=OFF `
             -DLLAMA_BUILD_EXAMPLES=OFF `
             -DLLAMA_BUILD_TESTS=OFF
         shell: pwsh
 
-      - name: Build
-        run: cmake --build build --config Release --target llama-server -j $env:NUMBER_OF_PROCESSORS
+      - name: Build ggml-vulkan only
+        run: |
+          cd source
+          cmake --build build --config Release --target ggml-vulkan -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
 
-      - name: Collect artifacts
+      - name: Collect ggml-vulkan.dll
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Get-ChildItem -Path build -Recurse -Filter "llama-server.exe" |
-            Where-Object { $_.FullName -notmatch "CMakeFiles" } |
-            Select-Object -First 1 | Copy-Item -Destination dist\ -Force
-          Get-ChildItem -Path build -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |
-            Where-Object { $_.FullName -notmatch "CMakeFiles" } |
-            Copy-Item -Destination dist\ -Force -ErrorAction SilentlyContinue
-          Write-Host "=== dist ===" ; Get-ChildItem dist\
+          $dll = Get-ChildItem -Path source\build -Recurse -Filter "ggml-vulkan.dll" |
+            Where-Object { $_.FullName -notmatch "CMakeFiles" } | Select-Object -First 1
+          if ($dll) {
+            Copy-Item $dll.FullName dist\ -Force
+            Write-Host "Collected:" $dll.FullName
+            Write-Host "Size:" ([math]::Round($dll.Length/1MB, 2)) "MB"
+          } else {
+            Write-Host "ERROR: ggml-vulkan.dll not found"
+            Get-ChildItem source\build -Recurse -Filter "*.dll" | Select-Object FullName, Length
+            exit 1
+          }
         shell: pwsh
 
-      - name: Upload artifact
+      - name: Upload ggml-vulkan.dll
         uses: actions/upload-artifact@v4
         with:
-          name: llama-server-vulkan-gdn-fix-windows-x64
-          path: dist\
+          name: ggml-vulkan-gdn-fix-lmstudio-2.31.2
+          path: dist\ggml-vulkan.dll
           retention-days: 30
