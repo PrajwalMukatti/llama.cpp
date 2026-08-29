@@ -32,10 +32,10 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
-    // Cache fusion sentinel (0 = non-fused, N+1 = fused with element-offset N).
-    // When > 0: write state into CacheBuf (binding 7) at element offset (state_out_off - 1).
-    // When = 0: write state into DstBuf at s_off (original non-fused behavior).
-    // The +1 sentinel avoids ambiguity when the real cache offset is 0.
+    // Cache fusion sentinel (0 = non-fused, N+1 = fused with cache element-offset N).
+    // When > 0: shader writes state into CacheBuf at offset (state_out_off - 1).
+    // When = 0: shader writes state into DstBuf at s_off (original behavior).
+    // state_size_per_snap (computed in shader) is reused as the slot stride.
     uint state_out_off;
 };
 

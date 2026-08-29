@@ -120,20 +120,13 @@ $oldPC = @"
         pc, { H, n_seqs, S_v });
 "@
 $newPC = @"
-    // Fused cache: when fused_cache != nullptr, pass cache buffer as binding 7
-    // and set state_out_off so the shader writes state directly into the cache.
-    uint32_t state_out_off    = 0;
-    uint32_t state_slot_stride = 0;
-    vk_subbuffer cache_buf = dst_buf; // dummy binding when not fused
+    // Fused cache: when fused_cache != nullptr, state_out_off is the sentinel-shifted
+    // element offset into the cache buffer. Shader uses state_out_off > 0 as fused test.
+    uint32_t state_out_off = 0;
+    vk_subbuffer cache_buf = dst_buf; // dummy binding 7 for non-fused path
 
     if (fused_cache != nullptr) {
-        state_out_off     = fused_cache->s_off_cache;
-        state_slot_stride = (uint32_t)fused_cache->slot_stride;
-        // Get the Vulkan subbuffer for the cache tensor
-        // The cache buffer is the destination of the CPY node we are fusing away.
-        // We get it from the fused_cache->data pointer via the buffer.
-        // For now use dst_buf as a placeholder — the state_out_off controls the write target.
-        // A future improvement would pass the actual cache vk_buffer here.
+        state_out_off = fused_cache->s_off_cache; // already +1 sentinel from detection
     }
 
     const vk_op_gated_delta_net_push_constants pc = {
@@ -144,8 +137,7 @@ $newPC = @"
         neq1, rq3,
         scale,
         K,
-        state_out_off,
-        state_slot_stride
+        state_out_off
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
