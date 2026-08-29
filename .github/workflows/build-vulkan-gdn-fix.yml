@@ -8,48 +8,55 @@ on:
 jobs:
   build-windows-vulkan:
     name: Windows x64 Vulkan
-    runs-on: windows-latest
+    runs-on: windows-2025
+
+    env:
+      VULKAN_VERSION: 1.4.357.0
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Vulkan SDK
-        uses: jakoch/install-vulkan-sdk-action@v1
-        with:
-          vulkan_version: 1.3.296.0
-          install_runtime: true
-          cache: true
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+        shell: pwsh
 
-      - name: Setup MSVC
-        uses: microsoft/setup-msbuild@v2
+      - name: Install Ninja
+        run: choco install ninja -y
+        shell: pwsh
 
       - name: Configure CMake
         run: |
-          cmake -S . -B build `
-            -G "Ninja" `
+          cmake -S . -B build -G "Ninja Multi-Config" `
+            -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake `
+            -DGGML_NATIVE=OFF `
             -DGGML_VULKAN=ON `
             -DGGML_CUDA=OFF `
             -DGGML_HIP=OFF `
-            -DGGML_METAL=OFF `
             -DLLAMA_BUILD_SERVER=ON `
             -DLLAMA_BUILD_EXAMPLES=OFF `
-            -DLLAMA_BUILD_TESTS=OFF `
-            -DCMAKE_BUILD_TYPE=Release
+            -DLLAMA_BUILD_TESTS=OFF
         shell: pwsh
 
-      - name: Build llama-server
-        run: cmake --build build --config Release --target llama-server -j 4
+      - name: Build
+        run: cmake --build build --config Release --target llama-server -j $env:NUMBER_OF_PROCESSORS
         shell: pwsh
 
       - name: Collect artifacts
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item build\llama-server.exe dist\ -Force -ErrorAction SilentlyContinue
-          Copy-Item build\bin\llama-server.exe dist\ -Force -ErrorAction SilentlyContinue
-          Get-ChildItem build\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination dist\
-          Get-ChildItem build\bin\*.dll -ErrorAction SilentlyContinue | Copy-Item -Destination dist\
-          Write-Host "=== dist contents ==="; Get-ChildItem dist\
+          Get-ChildItem -Path build -Recurse -Filter "llama-server.exe" |
+            Where-Object { $_.FullName -notmatch "CMakeFiles" } |
+            Select-Object -First 1 | Copy-Item -Destination dist\ -Force
+          Get-ChildItem -Path build\Release -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination dist\
+          Get-ChildItem -Path build\bin\Release -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Copy-Item -Destination dist\
+          Write-Host "=== dist contents ===" ; Get-ChildItem dist\
         shell: pwsh
 
       - name: Upload artifact
