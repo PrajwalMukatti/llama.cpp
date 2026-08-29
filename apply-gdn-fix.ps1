@@ -16,21 +16,37 @@ struct vk_gdn_fused_cache {
 };
 
 "@
+# Find the gdn push_constants struct and insert after its closing };
+# The struct ends with "    uint32_t K;`n};" — unique enough
 $targets = @(
-    "static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);",
-    "};`r`n`r`nstruct vk_op_ssm_scan_push_constants {",
-    "};`n`nstruct vk_op_ssm_scan_push_constants {"
+    "    uint32_t K;`r`n};`r`n`r`nstruct vk_op_ssm_scan_push_constants",
+    "    uint32_t K;`n};`n`nstruct vk_op_ssm_scan_push_constants",
+    "static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);"
 )
 $step1done = $false
 foreach ($t in $targets) {
     if ($c.Contains($t)) {
-        $c = $c.Replace($t, $t + $structAdd)
-        Write-Host "Step 1 OK: added vk_gdn_fused_cache (target: $($t.Substring(0,[Math]::Min(40,$t.Length))))"
-        $step1done = $true
-        break
+        # Insert after the closing }; of gdn push_constants (before ssm_scan)
+        $insertAfter = "    uint32_t K;" + [System.Environment]::NewLine + "};"
+        if ($c.Contains($insertAfter)) {
+            $insertIdx = $c.IndexOf($insertAfter) + $insertAfter.Length
+            $c = $c.Insert($insertIdx, $structAdd)
+            Write-Host "Step 1 OK: inserted vk_gdn_fused_cache after gdn push_constants"
+            $step1done = $true
+            break
+        }
     }
 }
-if (-not $step1done) { Write-Error "Step 1 FAILED: no target found"; exit 1 }
+if (-not $step1done) {
+    # Fallback: insert before the ssm_scan struct
+    $ssmIdx = $c.IndexOf("struct vk_op_ssm_scan_push_constants {")
+    if ($ssmIdx -ge 0) {
+        $c = $c.Insert($ssmIdx, $structAdd)
+        Write-Host "Step 1 OK: inserted before ssm_scan (fallback)"
+        $step1done = $true
+    }
+}
+if (-not $step1done) { Write-Error "Step 1 FAILED: no insertion point found"; exit 1 }
 
 # 2 - Add fusion function before ggml_vk_gated_delta_net
 $fusionFn = @"
