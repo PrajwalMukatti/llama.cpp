@@ -26,13 +26,26 @@ jobs:
         shell: pwsh
 
       - name: Install Ninja
-        run: choco install ninja -y
+        run: |
+          choco install ninja -y --no-progress
+          $ninjaPath = (Get-Command ninja -ErrorAction SilentlyContinue)?.Source
+          if (-not $ninjaPath) {
+            # choco installs to C:\ProgramData\chocolatey\bin
+            Add-Content $env:GITHUB_PATH "C:\ProgramData\chocolatey\bin"
+          }
+          Write-Host "Ninja: $(ninja --version)"
         shell: pwsh
+
+      - name: Setup Developer Command Prompt
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
       - name: Configure CMake
         run: |
-          cmake -S . -B build -G "Ninja Multi-Config" `
-            -DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake `
+          cmake -S . -B build `
+            -G "Ninja" `
+            -DCMAKE_BUILD_TYPE=Release `
             -DGGML_NATIVE=OFF `
             -DGGML_VULKAN=ON `
             -DGGML_CUDA=OFF `
@@ -52,11 +65,10 @@ jobs:
           Get-ChildItem -Path build -Recurse -Filter "llama-server.exe" |
             Where-Object { $_.FullName -notmatch "CMakeFiles" } |
             Select-Object -First 1 | Copy-Item -Destination dist\ -Force
-          Get-ChildItem -Path build\Release -Filter "*.dll" -ErrorAction SilentlyContinue |
-            Copy-Item -Destination dist\
-          Get-ChildItem -Path build\bin\Release -Filter "*.dll" -ErrorAction SilentlyContinue |
-            Copy-Item -Destination dist\
-          Write-Host "=== dist contents ===" ; Get-ChildItem dist\
+          Get-ChildItem -Path build -Recurse -Filter "*.dll" -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch "CMakeFiles" } |
+            Copy-Item -Destination dist\ -Force -ErrorAction SilentlyContinue
+          Write-Host "=== dist ===" ; Get-ChildItem dist\
         shell: pwsh
 
       - name: Upload artifact
